@@ -396,6 +396,7 @@ fn prepare_manifest(path: &Path) -> Result<()> {
             | table
                 .get_mut("dev-dependencies")
                 .map_or(false, remove_toml_path_deps)
+            | table.remove("bench").is_some()
         {
             fs::write(path, contents.to_string())
                 .with_context(|| format!("error writing file `{}`", path.display()))?;
