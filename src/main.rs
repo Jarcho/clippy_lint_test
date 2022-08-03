@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
-use cargo_metadata::{diagnostic::Diagnostic, CompilerMessage, Message};
+use cargo_metadata::{
+    diagnostic::{Diagnostic, DiagnosticLevel},
+    CompilerMessage, Message,
+};
 use clippy_lint_test::Version;
 use flate2::read::GzDecoder;
 use rm_rf::remove;
@@ -320,6 +323,7 @@ fn check_crate(
                     message:
                         Diagnostic {
                             rendered: Some(rendered),
+                            level: DiagnosticLevel::Error | DiagnosticLevel::Ice,
                             ..
                         },
                     ..
