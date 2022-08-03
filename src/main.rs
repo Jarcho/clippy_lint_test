@@ -162,6 +162,12 @@ fn find_crates(p: &Path) -> Result<HashMap<String, CrateInfo>> {
         let file = file.with_context(|| format!("error reading dir `{}`", p.display()))?;
         let path = file.path();
         if let Some(name) = parse_crate_name(&path) {
+            if name.crate_name.starts_with("rustc-ap")
+                | name.crate_name.starts_with("fast-rustc-ap")
+            {
+                // Ignore rustc crates as they likely won't build.
+                continue;
+            }
             match crates.entry(name.crate_name.into()) {
                 Entry::Vacant(e) => {
                     e.insert(CrateInfo {
