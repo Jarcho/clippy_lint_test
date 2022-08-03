@@ -1,0 +1,20 @@
+[package]
+name = "clippy_lint_test"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.58"
+argh = "0.1.8"
+cargo_metadata = "0.15.0"
+chrono = "0.4.19"
+csv = "1.1.6"
+flate2 = "1.0.24"
+home = "0.5.3"
+rm_rf = "0.6.2"
+tar = "0.4.38"
+temp-dir = "0.1.11"
+toml = "0.5.9"
+ureq = "2.5.0"
