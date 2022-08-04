@@ -301,30 +301,32 @@ fn check_crate(
     let output = command.output().context("error running `cargo`")?;
     if !output.status.success() {
         let mut msg = format!("error running clippy({})\n", output.status);
-        for message in Message::parse_stream(output.stdout.as_slice())
-            .filter_map(|m| {
-                let m = match m.context("error parsing `cargo` output") {
-                    Ok(m) => m,
-                    Err(e) => return Some(Err(e)),
-                };
-                if let Message::CompilerMessage(CompilerMessage {
-                    message:
-                        Diagnostic {
-                            rendered: Some(rendered),
-                            level: DiagnosticLevel::Error | DiagnosticLevel::Ice,
-                            ..
-                        },
-                    ..
-                }) = m
-                {
-                    Some(Ok(rendered))
-                } else {
-                    None
+        for message in Message::parse_stream(output.stdout.as_slice()) {
+            let message = message.context("error parsing `cargo` output")?;
+            if let Message::CompilerMessage(CompilerMessage {
+                message:
+                    Diagnostic {
+                        rendered: Some(rendered),
+                        level: DiagnosticLevel::Error | DiagnosticLevel::Ice,
+                        code,
+                        ..
+                    },
+                ..
+            }) = message
+            {
+                match code {
+                    Some(c) if c.code == "E0433" && rendered.contains("use winapi::") => {
+                        // Crate requires windows, don't bother printing errors.
+                        return Ok(Vec::new());
+                    }
+                    Some(c) if c.code == "E0455" && rendered.contains("lint kind `framework`") => {
+                        // Crate requires macos, don't bother printing errors.
+                        return Ok(Vec::new());
+                    }
+                    _ => (),
                 }
-            })
-            .collect::<Result<Vec<_>, _>>()?
-        {
-            msg.push_str(&message);
+                msg.push_str(&rendered);
+            }
         }
         msg.push_str(
             str::from_utf8(&output.stderr).context("error converting `cargo` output to `str`")?,
