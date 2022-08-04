@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use clippy_lint_test::Version;
+use clippy_lint_test::LatestVersions;
 use csv::{ReaderBuilder, StringRecord};
 use std::{
-    collections::hash_map::{Entry, HashMap},
+    collections::HashMap,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -25,8 +25,7 @@ struct Args {
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
 
-    let versions = read_versions(&args.dump_path);
-    let mut crates = read_crates(&args.dump_path, &versions);
+    let mut crates = read_crates(&args.dump_path, read_versions(&args.dump_path));
 
     crates.sort_by(|x, y| x.download_count.cmp(&y.download_count).reverse());
 
@@ -47,49 +46,51 @@ fn main() -> Result<()> {
     let crates = crates.get(..args.count.unwrap_or(500)).unwrap_or(&crates);
     // Dependencies likely have more downloads than dependant crates. Download in reverse order.
     for (i, c) in crates.iter().rev().enumerate() {
-        if crates_io_cache
-            .join(format!("{}-{}.crate", c.name, c.version))
-            .exists()
-        {
+        for version in c.versions.versions() {
+            if crates_io_cache
+                .join(format!("{}-{}.crate", c.name, version))
+                .exists()
+            {
+                print!("{}/{}\r", i, crates.len());
+                let _ = io::stdout().flush();
+                continue;
+            }
+
+            println!("fetching `{}-{}`", c.name, version);
             print!("{}/{}\r", i, crates.len());
             let _ = io::stdout().flush();
-            continue;
-        }
 
-        println!("fetching `{}-{}`", c.name, c.version);
-        print!("{}/{}\r", i, crates.len());
-        let _ = io::stdout().flush();
+            let mut toml_file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&toml_path)
+                .context("error creating item in temp dir")?;
 
-        let mut toml_file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&toml_path)
-            .context("error creating item in temp dir")?;
+            write!(
+                toml_file,
+                "[package]
+                name = \"package\"
+                version = \"0.1.0\"
 
-        write!(
-            toml_file,
-            "[package]
-            name = \"package\"
-            version = \"0.1.0\"
+                [dependencies]
+                {} = \"{}\"
+                ",
+                c.name, version
+            )
+            .context("error writing item in temp dir")?;
 
-            [dependencies]
-            {} = \"{}\"
-            ",
-            c.name, c.version
-        )
-        .context("error writing item in temp dir")?;
-
-        drop(toml_file);
-        if !Command::new("cargo")
-            .arg("fetch")
-            .current_dir(temp_path)
-            .output()
-            .unwrap()
-            .status
-            .success()
-        {
-            eprintln!("error fetching dependencies for `{}-{}`", c.name, c.version);
+            drop(toml_file);
+            if !Command::new("cargo")
+                .arg("fetch")
+                .current_dir(temp_path)
+                .output()
+                .unwrap()
+                .status
+                .success()
+            {
+                eprintln!("error fetching dependencies for `{}-{}`", c.name, version);
+            }
         }
     }
 
@@ -99,10 +100,10 @@ fn main() -> Result<()> {
 struct Crate {
     name: String,
     download_count: u64,
-    version: Version,
+    versions: LatestVersions,
 }
 
-fn read_versions(p: &Path) -> HashMap<u64, Version> {
+fn read_versions(p: &Path) -> HashMap<u64, LatestVersions> {
     let mut csv = ReaderBuilder::new()
         .has_headers(true)
         .from_path(p.join("versions.csv"))
@@ -110,7 +111,7 @@ fn read_versions(p: &Path) -> HashMap<u64, Version> {
 
     let headers = ["crate_id", "num", "yanked"];
     let indicies = headers_to_indicies(csv.headers().expect("error reading file header"), headers);
-    let mut result = HashMap::new();
+    let mut result = HashMap::<_, LatestVersions>::new();
     for r in csv.into_records() {
         let r = r.expect("error reading record");
         let data = extract_indicies(&r, indicies);
@@ -119,21 +120,13 @@ fn read_versions(p: &Path) -> HashMap<u64, Version> {
         }
         let id = data[0].parse().expect("error parsing crate id");
         if let Ok(version) = data[1].parse() {
-            match result.entry(id) {
-                Entry::Occupied(mut e) if version > *e.get() => {
-                    e.insert(version);
-                }
-                Entry::Occupied(_) => (),
-                Entry::Vacant(e) => {
-                    e.insert(version);
-                }
-            }
+            result.entry(id).or_default().push(version);
         }
     }
     result
 }
 
-fn read_crates(p: &Path, versions: &HashMap<u64, Version>) -> Vec<Crate> {
+fn read_crates(p: &Path, mut versions: HashMap<u64, LatestVersions>) -> Vec<Crate> {
     let mut csv = ReaderBuilder::new()
         .has_headers(true)
         .from_path(p.join("crates.csv"))
@@ -148,11 +141,11 @@ fn read_crates(p: &Path, versions: &HashMap<u64, Version>) -> Vec<Crate> {
             let download_count = data[0].parse().expect("error parsing crate id");
             let id = data[1].parse().expect("error parsing crate id");
             let name = data[2].into();
-            let version = *versions.get(&id)?;
+            let version = versions.remove(&id)?;
             Some(Crate {
                 name,
                 download_count,
-                version,
+                versions: version,
             })
         })
         .collect()

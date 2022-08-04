@@ -3,11 +3,11 @@ use cargo_metadata::{
     diagnostic::{Diagnostic, DiagnosticLevel},
     CompilerMessage, Message,
 };
-use clippy_lint_test::Version;
+use clippy_lint_test::{CrateName, LatestVersions};
 use flate2::read::GzDecoder;
 use rm_rf::remove;
 use std::{
-    collections::hash_map::{Entry, HashMap},
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
@@ -88,36 +88,46 @@ fn main() -> Result<()> {
             }))
             .context("error creating report file")?,
     );
-    for (i, c) in crates.values().enumerate() {
+    for (i, krate) in crates
+        .iter()
+        .flat_map(|(name, versions)| {
+            versions
+                .versions()
+                .map(move |version| format!("{}-{}", name, version))
+        })
+        .enumerate()
+    {
         if i > 0 && i % 256 == 0 {
             // Don't let the target directory get too big.
             let _ = remove(&target_dir);
         }
 
-        println!("Checking crate `{}`...", c.contained_name);
+        println!("Checking crate `{}`...", krate);
         print!("{}/{}\r", i, crates.len());
         let _ = io::stdout().flush();
-        match check_crate(&clippy_args, &target_dir, &mut lint_counters, c, temp_dir) {
+        match check_crate(
+            &clippy_args,
+            &target_dir,
+            &mut lint_counters,
+            &crates_dir,
+            &krate,
+            temp_dir,
+        ) {
             Ok(messages) if !messages.is_empty() => {
-                per_crate_count.insert(c.contained_name.clone(), messages.len());
                 println!("Found {} warnings", messages.len());
-                write!(
-                    report,
-                    "{}: {} warnings\n\n",
-                    c.contained_name,
-                    messages.len()
-                )
-                .context("error writing report")?;
-                for m in messages {
+                write!(report, "{}: {} warnings\n\n", krate, messages.len())
+                    .context("error writing report")?;
+                for m in &messages {
                     report
                         .write_all(m.as_bytes())
                         .context("error writing report")?;
                 }
                 writeln!(report).context("error writing report")?;
                 report.flush().context("error writing report")?;
+                per_crate_count.insert(krate, messages.len());
             }
             Ok(_) => (),
-            Err(e) => eprintln!("error checking crate `{}`: {}", c.contained_name, e),
+            Err(e) => eprintln!("{}", e),
         }
     }
 
@@ -135,56 +145,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-struct CrateFileName<'a> {
-    crate_name: &'a str,
-    version: Version,
-    contained_name: &'a str,
-}
-fn parse_crate_name(path: &Path) -> Option<CrateFileName<'_>> {
-    let stem = path.file_stem()?.to_str()?;
-    let (crate_name, version) = stem.rsplit_once('-')?;
-    Some(CrateFileName {
-        crate_name,
-        version: version.parse().ok()?,
-        contained_name: stem,
-    })
-}
-
-struct CrateInfo {
-    path: PathBuf,
-    version: Version,
-    contained_name: String,
-}
-
-fn find_crates(p: &Path) -> Result<HashMap<String, CrateInfo>> {
-    let mut crates = HashMap::new();
+fn find_crates(p: &Path) -> Result<HashMap<String, LatestVersions>> {
+    let mut crates = HashMap::<_, LatestVersions>::new();
     for file in fs::read_dir(p).with_context(|| format!("error reading dir `{}`", p.display()))? {
         let file = file.with_context(|| format!("error reading dir `{}`", p.display()))?;
-        let path = file.path();
-        if let Some(name) = parse_crate_name(&path) {
-            if name.crate_name.starts_with("rustc-ap")
-                | name.crate_name.starts_with("fast-rustc-ap")
-            {
+        if let Some(name) = file
+            .path()
+            .file_stem()
+            .and_then(|name| CrateName::from_file_name(name.to_str()?))
+        {
+            if name.name.starts_with("rustc-ap") | name.name.starts_with("fast-rustc-ap") {
                 // Ignore rustc crates as they likely won't build.
                 continue;
             }
-            match crates.entry(name.crate_name.into()) {
-                Entry::Vacant(e) => {
-                    e.insert(CrateInfo {
-                        version: name.version,
-                        contained_name: name.contained_name.into(),
-                        path,
-                    });
-                }
-                Entry::Occupied(mut e) if name.version > e.get().version => {
-                    e.insert(CrateInfo {
-                        version: name.version,
-                        contained_name: name.contained_name.into(),
-                        path,
-                    });
-                }
-                Entry::Occupied(_) => (),
-            }
+            crates
+                .entry(name.name.into())
+                .or_default()
+                .push(name.version);
         }
     }
     Ok(crates)
@@ -287,11 +264,12 @@ fn check_crate(
     clippy_args: &ClippyArgs,
     target_dir: &Path,
     lints: &mut HashMap<String, usize>,
-    krate: &CrateInfo,
+    crates_dir: &Path,
+    krate: &str,
     temp_dir: &Path,
 ) -> Result<Vec<String>> {
-    extract_crate(&krate.path, temp_dir)?;
-    let path = temp_dir.join(&krate.contained_name);
+    extract_crate(&crates_dir.join(format!("{}.crate", krate)), temp_dir)?;
+    let path = temp_dir.join(krate);
     let _delayed = RemoveOnDrop(&path);
     remove_file(&path.join(".cargo").join("config"))?;
     remove_file(&path.join("Cargo.lock"))?;
