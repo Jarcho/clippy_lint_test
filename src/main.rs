@@ -5,6 +5,7 @@ use cargo_metadata::{
 };
 use clippy_lint_test::{CrateName, LatestVersions};
 use flate2::read::GzDecoder;
+use regex::{Regex, RegexBuilder};
 use rm_rf::remove;
 use std::{
     collections::HashMap,
@@ -31,10 +32,23 @@ struct Args {
     /// lints to test
     #[argh(option, short = 'l', long = "lint")]
     lints: Vec<String>,
+
+    /// regex filter of which messages to accept
+    #[argh(option, short = 'f', long = "filter")]
+    filter: Option<String>,
 }
 
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
+    let filter = args
+        .filter
+        .map(|f| {
+            RegexBuilder::new(&f)
+                .build()
+                .with_context(|| format!("error parsing `{}`", f))
+        })
+        .transpose()?;
+
     let temp_dir = temp_dir::TempDir::new().expect("error creating temp dir");
     let temp_dir = temp_dir.path();
 
@@ -111,6 +125,7 @@ fn main() -> Result<()> {
             &mut lint_counters,
             &crates_dir,
             &krate,
+            filter.as_ref(),
             temp_dir,
         ) {
             Ok(messages) if !messages.is_empty() => {
@@ -266,6 +281,7 @@ fn check_crate(
     lints: &mut HashMap<String, usize>,
     crates_dir: &Path,
     krate: &str,
+    filter: Option<&Regex>,
     temp_dir: &Path,
 ) -> Result<Vec<String>> {
     extract_crate(&crates_dir.join(format!("{}.crate", krate)), temp_dir)?;
@@ -350,9 +366,13 @@ fn check_crate(
                 ..
             }) = m
             {
-                if let Some(count) = lints.get_mut(&code.code) {
-                    *count += 1;
-                    Some(Ok(rendered))
+                if filter.map_or(true, |f| f.is_match(&rendered)) {
+                    if let Some(count) = lints.get_mut(&code.code) {
+                        *count += 1;
+                        Some(Ok(rendered))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
