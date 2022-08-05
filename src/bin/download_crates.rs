@@ -24,10 +24,19 @@ struct Args {
 
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
+    let count = args.count.unwrap_or(500);
 
-    let mut crates = read_crates(&args.dump_path, read_versions(&args.dump_path));
-
-    crates.sort_by(|x, y| x.download_count.cmp(&y.download_count).reverse());
+    let versions = read_versions(&args.dump_path);
+    let mut crates = read_crates(&args.dump_path);
+    let crates = if crates.len() <= count {
+        crates.as_slice()
+    } else {
+        crates
+            .select_nth_unstable_by(count, |x, y| {
+                x.download_count.cmp(&y.download_count).reverse()
+            })
+            .0
+    };
 
     let dir = TempDir::new().context("error creating temp dir")?;
     let temp_path = dir.path();
@@ -36,6 +45,7 @@ fn main() -> Result<()> {
     fs::File::create(temp_path.join("src").join("lib.rs"))
         .context("error creating item in temp dir")?;
     let toml_path = temp_path.join("Cargo.toml");
+
     let cargo_home =
         home::cargo_home_with_cwd(temp_path).context("error getting cargo home dir")?;
     let crates_io_cache = cargo_home
@@ -43,54 +53,55 @@ fn main() -> Result<()> {
         .join("cache")
         .join("github.com-1ecc6299db9ec823");
 
-    let crates = crates.get(..args.count.unwrap_or(500)).unwrap_or(&crates);
-    // Dependencies likely have more downloads than dependant crates. Download in reverse order.
-    for (i, c) in crates.iter().rev().enumerate() {
-        for version in c.versions.versions() {
-            if crates_io_cache
-                .join(format!("{}-{}.crate", c.name, version))
-                .exists()
-            {
-                print!("{}/{}\r", i, crates.len());
-                let _ = io::stdout().flush();
-                continue;
-            }
+    // Dependencies likely have more downloads than dependant crates.
+    // Download in reverse order to reduce the number of `cargo fetch` calls.
+    for (i, id) in crates
+        .iter()
+        .rev()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let name = &c.name;
+            versions
+                .get(&c.id)
+                .map(move |v| v.iter_ids(name).map(move |id| (i, id)))
+        })
+        .flatten()
+        .filter(|(_, id)| !crates_io_cache.join(format!("{}.crate", id)).exists())
+    {
+        println!("fetching `{}`", id);
+        print!("{}/{}\r", i + 1, crates.len());
+        let _ = io::stdout().flush();
 
-            println!("fetching `{}-{}`", c.name, version);
-            print!("{}/{}\r", i, crates.len());
-            let _ = io::stdout().flush();
+        let mut toml_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&toml_path)
+            .context("error creating item in temp dir")?;
 
-            let mut toml_file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&toml_path)
-                .context("error creating item in temp dir")?;
-
-            write!(
-                toml_file,
-                "[package]
+        write!(
+            toml_file,
+            "[package]
                 name = \"package\"
                 version = \"0.1.0\"
 
                 [dependencies]
                 {} = \"{}\"
                 ",
-                c.name, version
-            )
-            .context("error writing item in temp dir")?;
+            id.name, id.version
+        )
+        .context("error writing item in temp dir")?;
 
-            drop(toml_file);
-            if !Command::new("cargo")
-                .arg("fetch")
-                .current_dir(temp_path)
-                .output()
-                .unwrap()
-                .status
-                .success()
-            {
-                eprintln!("error fetching dependencies for `{}-{}`", c.name, version);
-            }
+        drop(toml_file);
+        if !Command::new("cargo")
+            .arg("fetch")
+            .current_dir(temp_path)
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            eprintln!("error fetching dependencies");
         }
     }
 
@@ -98,11 +109,12 @@ fn main() -> Result<()> {
 }
 
 struct Crate {
+    id: u64,
     name: String,
     download_count: u64,
-    versions: LatestVersions,
 }
 
+/// Parses the versions database to extract the latest version number for each crate.
 fn read_versions(p: &Path) -> HashMap<u64, LatestVersions> {
     let mut csv = ReaderBuilder::new()
         .has_headers(true)
@@ -126,7 +138,8 @@ fn read_versions(p: &Path) -> HashMap<u64, LatestVersions> {
     result
 }
 
-fn read_crates(p: &Path, mut versions: HashMap<u64, LatestVersions>) -> Vec<Crate> {
+/// Parses the crates database to extract the crate name and download count.
+fn read_crates(p: &Path) -> Vec<Crate> {
     let mut csv = ReaderBuilder::new()
         .has_headers(true)
         .from_path(p.join("crates.csv"))
@@ -144,16 +157,16 @@ fn read_crates(p: &Path, mut versions: HashMap<u64, LatestVersions>) -> Vec<Crat
             let download_count = data[0].parse().expect("error parsing crate id");
             let id = data[1].parse().expect("error parsing crate id");
             let name = data[2].into();
-            let versions = versions.remove(&id)?;
             Some(Crate {
+                id,
                 name,
                 download_count,
-                versions,
             })
         })
         .collect()
 }
 
+/// Converts a list of header names to their column indicies.
 fn headers_to_indicies<const N: usize>(r: &StringRecord, headers: [&'static str; N]) -> [usize; N] {
     let mut found = [None; N];
     for (i, field) in r.iter().enumerate() {
@@ -164,6 +177,7 @@ fn headers_to_indicies<const N: usize>(r: &StringRecord, headers: [&'static str;
     found.map(|x| x.expect("failed to find header"))
 }
 
+/// Extracts the data for the the given indicies
 fn extract_indicies<const N: usize>(r: &StringRecord, indicies: [usize; N]) -> [&str; N] {
     let mut found = [None; N];
     for (i, field) in r.iter().enumerate() {

@@ -3,7 +3,7 @@ use cargo_metadata::{
     diagnostic::{Diagnostic, DiagnosticLevel},
     CompilerMessage, Message,
 };
-use clippy_lint_test::{is_rustc_crate, CrateName, LatestVersions};
+use clippy_lint_test::{is_rustc_crate, CrateId, LatestVersions};
 use flate2::read::GzDecoder;
 use regex::{Regex, RegexBuilder};
 use rm_rf::remove;
@@ -49,33 +49,9 @@ fn main() -> Result<()> {
         })
         .transpose()?;
 
-    let temp_dir = temp_dir::TempDir::new().expect("error creating temp dir");
-    let temp_dir = temp_dir.path();
-
-    let home_dir = home::cargo_home().context("error finding cargo home dir")?;
-    let crates_dir = home_dir
-        .join("registry")
-        .join("cache")
-        .join("github.com-1ecc6299db9ec823");
-    let crates = find_crates(&crates_dir)?;
-
     println!("Compiling clippy...");
     let clippy_args = compile_clippy(&args.clippy_dir)?;
-    let target_dir = temp_dir.join("target");
-    let mut lint_counters = args
-        .lints
-        .into_iter()
-        .map(|name| {
-            let name = name.replace('-', "_");
-            let name = if !name.starts_with("clippy::") {
-                format!("clippy::{}", name)
-            } else {
-                name
-            };
-            (name, 0usize)
-        })
-        .collect::<HashMap<_, _>>();
-    let mut per_crate_count = HashMap::new();
+
     let mut report = io::BufWriter::new(
         fs::OpenOptions::new()
             .write(true)
@@ -102,29 +78,53 @@ fn main() -> Result<()> {
             }))
             .context("error creating report file")?,
     );
-    for (i, krate) in crates
-        .iter()
-        .flat_map(|(name, versions)| {
-            versions
-                .versions()
-                .map(move |version| format!("{}-{}", name, version))
+
+    let mut lint_counters = args
+        .lints
+        .into_iter()
+        .map(|name| {
+            let name = name.replace('-', "_");
+            let name = if !name.starts_with("clippy::") {
+                format!("clippy::{}", name)
+            } else {
+                name
+            };
+            (name, 0usize)
         })
-        .enumerate()
-    {
+        .collect::<HashMap<_, _>>();
+    let mut per_crate_count = HashMap::<&str, _>::new();
+
+    let home_dir = home::cargo_home().context("error finding cargo home dir")?;
+    let crates_dir = home_dir
+        .join("registry")
+        .join("cache")
+        .join("github.com-1ecc6299db9ec823");
+    let crates = find_crates(&crates_dir)?;
+    let mut crate_ids = Vec::with_capacity(crates.len() * 2);
+    for (name, versions) in crates {
+        crate_ids.extend(versions.iter_ids(&name).map(|x| x.to_string()));
+    }
+    let crates = crate_ids;
+
+    let temp_dir = temp_dir::TempDir::new().expect("error creating temp dir");
+    let temp_dir = temp_dir.path();
+    let target_dir = temp_dir.join("target");
+
+    for (i, krate) in crates.iter().enumerate() {
         if i > 0 && i % 256 == 0 {
             // Don't let the target directory get too big.
             let _ = remove(&target_dir);
         }
 
         println!("Checking crate `{}`...", krate);
-        print!("{}/{}\r", i, crates.len());
+        print!("{}/{}\r", i + 1, crates.len());
         let _ = io::stdout().flush();
         match check_crate(
             &clippy_args,
             &target_dir,
             &mut lint_counters,
             &crates_dir,
-            &krate,
+            krate,
             filter.as_ref(),
             temp_dir,
         ) {
@@ -164,19 +164,16 @@ fn find_crates(p: &Path) -> Result<HashMap<String, LatestVersions>> {
     let mut crates = HashMap::<_, LatestVersions>::new();
     for file in fs::read_dir(p).with_context(|| format!("error reading dir `{}`", p.display()))? {
         let file = file.with_context(|| format!("error reading dir `{}`", p.display()))?;
-        if let Some(name) = file
+        if let Some(id) = file
             .path()
             .file_stem()
-            .and_then(|name| CrateName::from_file_name(name.to_str()?))
+            .and_then(|name| CrateId::parse(name.to_str()?))
         {
-            if is_rustc_crate(name.name) {
+            if is_rustc_crate(id.name) {
                 // Ignore rustc crates as they likely won't build.
                 continue;
             }
-            crates
-                .entry(name.name.into())
-                .or_default()
-                .push(name.version);
+            crates.entry(id.name.into()).or_default().push(id.version);
         }
     }
     Ok(crates)
@@ -285,6 +282,7 @@ fn check_crate(
     temp_dir: &Path,
 ) -> Result<Vec<String>> {
     extract_crate(&crates_dir.join(format!("{}.crate", krate)), temp_dir)?;
+
     let path = temp_dir.join(krate);
     let _delayed = RemoveOnDrop(&path);
     remove_file(&path.join(".cargo").join("config"))?;
@@ -293,7 +291,7 @@ fn check_crate(
     prepare_manifest(&manifest_path)?;
 
     let args: [&OsStr; 14] = [
-        "--".as_ref(),
+        "--".as_ref(), // command name
         "--manifest-path".as_ref(),
         manifest_path.as_ref(),
         "--quiet".as_ref(),

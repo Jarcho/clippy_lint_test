@@ -1,5 +1,6 @@
 use core::{borrow::Borrow, cmp::Ordering, fmt};
 
+/// The main part of a version number
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MainVersion {
     pub major: u16,
@@ -17,12 +18,14 @@ impl fmt::Debug for MainVersion {
     }
 }
 
+/// The prerelease part of a version number. `T` should be an owned or borrowed string.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PreVersion<T> {
     pub stream: T,
     pub version: u16,
 }
 impl<T: Borrow<str>> PreVersion<T> {
+    /// Borrows the stream name.
     pub fn borrow(&self) -> PreVersion<&str> {
         PreVersion {
             stream: self.stream.borrow(),
@@ -31,6 +34,7 @@ impl<T: Borrow<str>> PreVersion<T> {
     }
 }
 impl<T: ?Sized + ToOwned> PreVersion<&'_ T> {
+    /// Converts the stream name to it's owned form.
     pub fn to_owned(&self) -> PreVersion<T::Owned> {
         PreVersion {
             stream: self.stream.to_owned(),
@@ -39,12 +43,14 @@ impl<T: ?Sized + ToOwned> PreVersion<&'_ T> {
     }
 }
 
+/// A version number with an optional pre-release part. `T` should be an owned or borrowed string.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Version<T> {
     version: MainVersion,
     pre: Option<PreVersion<T>>,
 }
 impl<T: Borrow<str>> Version<T> {
+    /// Borrows the pre-release stream name.
     pub fn borrow(&self) -> Version<&str> {
         Version {
             version: self.version,
@@ -53,6 +59,7 @@ impl<T: Borrow<str>> Version<T> {
     }
 }
 impl<T: ?Sized + ToOwned> Version<&'_ T> {
+    /// Converts the pre-release stream name to it's owned form.
     pub fn to_owned(&self) -> Version<T::Owned> {
         Version {
             version: self.version,
@@ -61,6 +68,7 @@ impl<T: ?Sized + ToOwned> Version<&'_ T> {
     }
 }
 impl<'a> Version<&'a str> {
+    /// Attempts to parse a version number from a string.
     pub fn parse(s: &'a str) -> Option<Self> {
         let mut iter = s.splitn(3, '.');
         let major = iter.next()?.parse().ok()?;
@@ -104,7 +112,7 @@ impl<T: fmt::Display> fmt::Debug for Version<T> {
     }
 }
 
-/// Stores the latest stable version, as well as the latest prerelease version if it's greater than the latest stable version.
+/// Stores the latest stable version, as well as the latest prerelease version if it's newer than the latest stable version.
 #[derive(Default)]
 pub struct LatestVersions {
     stable: Option<MainVersion>,
@@ -112,6 +120,7 @@ pub struct LatestVersions {
     pre_by_stream: Vec<PreVersion<String>>,
 }
 impl LatestVersions {
+    /// Replaces the current version with the given version if it's newer.
     pub fn push(&mut self, arg: Version<&'_ str>) {
         if self.stable.map_or(true, |v| v > arg.version) {
             // current stable version is newer than the incoming version.
@@ -152,25 +161,32 @@ impl LatestVersions {
         }
     }
 
-    pub fn versions(&self) -> impl Iterator<Item = Version<&'_ str>> {
+    /// Gets an iterator over all stable and pre-release versions.
+    pub fn iter_ids<'a>(&'a self, name: &'a str) -> impl Iterator<Item = CrateId<'a>> {
         self.stable
             .into_iter()
-            .map(|version| Version { version, pre: None })
-            .chain(self.pre.into_iter().flat_map(|version| {
-                self.pre_by_stream.iter().map(move |prerelease| Version {
-                    version,
-                    pre: Some(prerelease.borrow()),
+            .map(move |version| CrateId {
+                name,
+                version: Version { version, pre: None },
+            })
+            .chain(self.pre.into_iter().flat_map(move |version| {
+                self.pre_by_stream.iter().map(move |prerelease| CrateId {
+                    name,
+                    version: Version {
+                        version,
+                        pre: Some(prerelease.borrow()),
+                    },
                 })
             }))
     }
 }
 
-pub struct CrateName<'a> {
+pub struct CrateId<'a> {
     pub name: &'a str,
     pub version: Version<&'a str>,
 }
-impl<'a> CrateName<'a> {
-    pub fn from_file_name(name: &'a str) -> Option<Self> {
+impl<'a> CrateId<'a> {
+    pub fn parse(name: &'a str) -> Option<Self> {
         name.bytes()
             .enumerate()
             .rev()
@@ -187,7 +203,13 @@ impl<'a> CrateName<'a> {
             })
     }
 }
+impl fmt::Display for CrateId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}-{}", self.name, self.version)
+    }
+}
 
+/// Checks if string names an auto-published rustc crate. These no longer compile.
 pub fn is_rustc_crate(name: &str) -> bool {
     name.starts_with("rustc-ap") | name.starts_with("fast-rustc-ap")
 }
