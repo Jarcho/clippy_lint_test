@@ -3,7 +3,7 @@ use cargo_metadata::{
     diagnostic::{Diagnostic, DiagnosticLevel},
     CompilerMessage, Message,
 };
-use clippy_lint_test::{CrateName, LatestVersions};
+use clippy_lint_test::{is_rustc_crate, CrateName, LatestVersions};
 use flate2::read::GzDecoder;
 use regex::{Regex, RegexBuilder};
 use rm_rf::remove;
@@ -169,7 +169,7 @@ fn find_crates(p: &Path) -> Result<HashMap<String, LatestVersions>> {
             .file_stem()
             .and_then(|name| CrateName::from_file_name(name.to_str()?))
         {
-            if name.name.starts_with("rustc-ap") | name.name.starts_with("fast-rustc-ap") {
+            if is_rustc_crate(name.name) {
                 // Ignore rustc crates as they likely won't build.
                 continue;
             }

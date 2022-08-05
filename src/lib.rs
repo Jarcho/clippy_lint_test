@@ -187,3 +187,7 @@ impl<'a> CrateName<'a> {
             })
     }
 }
+
+pub fn is_rustc_crate(name: &str) -> bool {
+    name.starts_with("rustc-ap") | name.starts_with("fast-rustc-ap")
+}

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clippy_lint_test::{LatestVersions, Version};
+use clippy_lint_test::{is_rustc_crate, LatestVersions, Version};
 use csv::{ReaderBuilder, StringRecord};
 use std::{
     collections::HashMap,
@@ -138,14 +138,17 @@ fn read_crates(p: &Path, mut versions: HashMap<u64, LatestVersions>) -> Vec<Crat
         .filter_map(|r| {
             let r = r.expect("error reading record");
             let data = extract_indicies(&r, indicies);
+            if is_rustc_crate(data[2]) {
+                return None;
+            }
             let download_count = data[0].parse().expect("error parsing crate id");
             let id = data[1].parse().expect("error parsing crate id");
             let name = data[2].into();
-            let version = versions.remove(&id)?;
+            let versions = versions.remove(&id)?;
             Some(Crate {
                 name,
                 download_count,
-                versions: version,
+                versions,
             })
         })
         .collect()
