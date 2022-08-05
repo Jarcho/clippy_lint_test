@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clippy_lint_test::LatestVersions;
+use clippy_lint_test::{LatestVersions, Version};
 use csv::{ReaderBuilder, StringRecord};
 use std::{
     collections::HashMap,
@@ -119,7 +119,7 @@ fn read_versions(p: &Path) -> HashMap<u64, LatestVersions> {
             continue;
         }
         let id = data[0].parse().expect("error parsing crate id");
-        if let Ok(version) = data[1].parse() {
+        if let Some(version) = Version::parse(data[1]) {
             result.entry(id).or_default().push(version);
         }
     }
