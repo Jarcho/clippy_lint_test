@@ -25,7 +25,7 @@ struct Args {
     #[argh(positional)]
     clippy_dir: PathBuf,
 
-    /// the name of the report file, defaults to `CLIPPY_BRANCH_NAME-CURRENT_DATE.txt`
+    /// the name of the report file (default `CLIPPY_BRANCH_NAME-CURRENT_DATE.txt`)
     #[argh(option, short = 'r', long = "report-file")]
     report_name: Option<PathBuf>,
 
@@ -36,6 +36,10 @@ struct Args {
     /// regex filter of which messages to accept
     #[argh(option, short = 'f', long = "filter")]
     filter: Option<String>,
+
+    /// the number of crates to compile before clearing the target directory (default 500)
+    #[argh(option, long = "cache-size")]
+    cache_size: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +52,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("error parsing `{}`", f))
         })
         .transpose()?;
+    let cache_size = args.cache_size.unwrap_or(500);
 
     println!("Compiling clippy...");
     let clippy_args = compile_clippy(&args.clippy_dir)?;
@@ -59,7 +64,7 @@ fn main() -> Result<()> {
             .truncate(true)
             .open(args.report_name.unwrap_or_else(|| {
                 let res = Command::new("git")
-                    .args(["branch", "--show_current"])
+                    .args(["branch", "--show-current"])
                     .current_dir(&args.clippy_dir)
                     .output();
                 let name = res.map_or(None, |res| {
@@ -111,7 +116,7 @@ fn main() -> Result<()> {
     let target_dir = temp_dir.join("target");
 
     for (i, krate) in crates.iter().enumerate() {
-        if i > 0 && i % 256 == 0 {
+        if i > 0 && i % cache_size == 0 {
             // Don't let the target directory get too big.
             let _ = remove(&target_dir);
         }
