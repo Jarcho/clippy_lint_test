@@ -244,14 +244,12 @@ struct ClippyArgs {
 }
 impl ClippyArgs {
     fn run_command(&self) -> Command {
-        let args: [&OsStr; 10] = [
+        let args: [&OsStr; 8] = [
             self.channel.as_ref(),
             "--quiet".as_ref(),
             "run".as_ref(),
             &self.manifest,
             "--release".as_ref(),
-            "--cap-lints".as_ref(),
-            "allow".as_ref(),
             "--bin".as_ref(),
             "cargo-clippy".as_ref(),
             "--".as_ref(),
@@ -291,13 +289,11 @@ fn compile_clippy(p: &Path) -> Result<ClippyArgs> {
     let mut manifest_arg: OsString = "--manifest-path=".into();
     manifest_arg.push(p.join("Cargo.toml"));
 
-    let args: [&OsStr; 6] = [
+    let args: [&OsStr; 4] = [
         channel_arg.as_ref(),
         "build".as_ref(),
         &manifest_arg,
         "--release".as_ref(),
-        "--cap-lints".as_ref(),
-        "allow".as_ref(),
     ];
     let output = Command::new("cargo")
         .args(args)
