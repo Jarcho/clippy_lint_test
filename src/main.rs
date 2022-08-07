@@ -347,6 +347,8 @@ fn check_crate(
     remove_file(&path.join("Cargo.lock"))?;
     let manifest_path = path.join("Cargo.toml");
     prepare_manifest(&manifest_path)?;
+    let _ = remove(&path.join("tests"));
+    let _ = remove(&path.join("benches"));
 
     let args: [&OsStr; 7] = [
         "--".as_ref(), // command name
