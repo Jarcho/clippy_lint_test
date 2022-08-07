@@ -346,7 +346,7 @@ fn check_crate(
     remove_file(&path.join(".cargo").join("config"))?;
     remove_file(&path.join("Cargo.lock"))?;
     let manifest_path = path.join("Cargo.toml");
-    prepare_manifest(&manifest_path)?;
+    prepare_manifest(&manifest_path, &path.join("Cargo.toml.orig"))?;
     let _ = remove(&path.join("tests"));
     let _ = remove(&path.join("benches"));
 
@@ -439,8 +439,9 @@ fn extract_crate(file: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("error unpacking file `{}`", file.display()))
 }
 
-fn prepare_manifest(path: &Path) -> Result<()> {
-    let mut contents: toml::Value = fs::read_to_string(path)
+fn prepare_manifest(path: &Path, orig_path: &Path) -> Result<()> {
+    let mut contents: toml::Value = fs::read_to_string(orig_path)
+        .or_else(|_| fs::read_to_string(path))
         .with_context(|| format!("error reading file `{}`", path.display()))?
         .parse()
         .with_context(|| format!("error parsing file `{}`", path.display()))?;
