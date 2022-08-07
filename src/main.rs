@@ -1,8 +1,5 @@
 use anyhow::{bail, Context, Result};
-use cargo_metadata::{
-    diagnostic::{Diagnostic, DiagnosticLevel},
-    CompilerMessage, Message,
-};
+use cargo_metadata::{diagnostic::DiagnosticLevel, CompilerMessage, Message};
 use clippy_lint_test::{is_rustc_crate, CrateId, LatestVersions};
 use flate2::read::GzDecoder;
 use regex::{Regex, RegexBuilder};
@@ -97,7 +94,7 @@ fn main() -> Result<()> {
             (name, 0usize)
         })
         .collect::<HashMap<_, _>>();
-    let mut per_crate_count = HashMap::<&str, _>::new();
+    let mut per_crate_count = HashMap::<&str, (usize, bool)>::new();
 
     let home_dir = home::cargo_home().context("error finding cargo home dir")?;
     let crates_dir = home_dir
@@ -133,27 +130,46 @@ fn main() -> Result<()> {
             filter.as_ref(),
             temp_dir,
         ) {
-            Ok(messages) if !messages.is_empty() => {
-                println!("Found {} warnings", messages.len());
-                write!(report, "{}: {} warnings\n\n", krate, messages.len())
-                    .context("error writing report")?;
-                for m in &messages {
-                    report
-                        .write_all(m.as_bytes())
+            Ok(output) => {
+                if !output.lint_msgs.is_empty() {
+                    println!("Found {} warnings", output.lint_msgs.len());
+                    write!(report, "{}: {} warnings\n\n", krate, output.lint_msgs.len())
                         .context("error writing report")?;
+                    for m in &output.lint_msgs {
+                        report
+                            .write_all(m.as_bytes())
+                            .context("error writing report")?;
+                    }
+                    writeln!(report).context("error writing report")?;
+                    report.flush().context("error writing report")?;
+                    per_crate_count.entry(krate).or_default().0 = output.lint_msgs.len();
                 }
-                writeln!(report).context("error writing report")?;
-                report.flush().context("error writing report")?;
-                per_crate_count.insert(krate, messages.len());
+                if !output.ice_msg.is_empty() {
+                    println!();
+                    write!(report, "{}: ICE\n\n{}\n", krate, output.ice_msg)
+                        .context("error writing report")?;
+                    report.flush().context("error writing report")?;
+                    per_crate_count.entry(krate).or_default().1 = true;
+                }
+                if !output.err_msg.is_empty() {
+                    println!("{}", output.err_msg);
+                }
             }
-            Ok(_) => (),
             Err(e) => eprintln!("{}", e),
         }
     }
 
     write!(report, "\nReport summary:\n\n").context("error writing report")?;
-    for (krate, count) in per_crate_count {
-        writeln!(report, "{}: {} warnings", krate, count).context("error writing report")?
+    for (krate, (count, ice)) in per_crate_count {
+        writeln!(
+            report,
+            "{}: {}{} warning{}",
+            krate,
+            if ice { "ICE, " } else { "" },
+            count,
+            if count == 1 { "" } else { "s" },
+        )
+        .context("error writing report")?
     }
     writeln!(report).context("error writing report")?;
     for (lint, count) in lint_counters {
@@ -277,6 +293,13 @@ impl Drop for RemoveOnDrop<'_> {
     }
 }
 
+#[derive(Default)]
+struct RunOutput {
+    pub lint_msgs: Vec<String>,
+    pub err_msg: String,
+    pub ice_msg: String,
+}
+
 fn check_crate(
     clippy_args: &ClippyArgs,
     target_dir: &Path,
@@ -285,7 +308,7 @@ fn check_crate(
     krate: &str,
     filter: Option<&Regex>,
     temp_dir: &Path,
-) -> Result<Vec<String>> {
+) -> Result<RunOutput> {
     extract_crate(&crates_dir.join(format!("{}.crate", krate)), temp_dir)?;
 
     let path = temp_dir.join(krate);
@@ -318,72 +341,52 @@ fn check_crate(
         command.args(args);
     }
     let output = command.output().context("error running `cargo`")?;
+
+    let mut result = RunOutput::default();
+
     if !output.status.success() {
-        let mut msg = format!("error running clippy({})\n", output.status);
-        for message in Message::parse_stream(output.stdout.as_slice()) {
-            let message = message.context("error parsing `cargo` output")?;
-            if let Message::CompilerMessage(CompilerMessage {
-                message:
-                    Diagnostic {
-                        rendered: Some(rendered),
-                        level: DiagnosticLevel::Error | DiagnosticLevel::Ice,
-                        code,
-                        ..
-                    },
-                ..
-            }) = message
-            {
-                match code {
-                    Some(c) if c.code == "E0433" && rendered.contains("use winapi::") => {
-                        // Crate requires windows, don't bother printing errors.
-                        return Ok(Vec::new());
-                    }
-                    Some(c) if c.code == "E0455" && rendered.contains("lint kind `framework`") => {
-                        // Crate requires macos, don't bother printing errors.
-                        return Ok(Vec::new());
-                    }
-                    _ => (),
-                }
-                msg.push_str(&rendered);
-            }
-        }
-        msg.push_str(
-            str::from_utf8(&output.stderr).context("error converting `cargo` output to `str`")?,
-        );
-        bail!(msg);
+        result.err_msg = format!("error running clippy ({}):\n", output.status);
     }
 
-    Message::parse_stream(output.stdout.as_slice())
-        .filter_map(|m| {
-            let m = match m.context("error parsing `cargo` output") {
-                Ok(m) => m,
-                Err(e) => return Some(Err(e)),
-            };
-            if let Message::CompilerMessage(CompilerMessage {
-                message:
-                    Diagnostic {
-                        code: Some(code),
-                        rendered: Some(rendered),
-                        ..
-                    },
-                ..
-            }) = m
-            {
-                if filter.map_or(true, |f| f.is_match(&rendered)) {
-                    if let Some(count) = lints.get_mut(&code.code) {
-                        *count += 1;
-                        Some(Ok(rendered))
-                    } else {
-                        None
+    for m in Message::parse_stream(output.stdout.as_slice()) {
+        let m = m.context("error parsing `cargo` output")?;
+        if let Message::CompilerMessage(CompilerMessage { message: m, .. }) = m {
+            match (m.level, m.code, m.rendered) {
+                (DiagnosticLevel::Warning, Some(c), Some(m)) => {
+                    if let Some(count) = lints.get_mut(&c.code) {
+                        if filter.map_or(true, |f| f.is_match(&m)) {
+                            *count += 1;
+                            result.lint_msgs.push(m);
+                        }
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
+                (DiagnosticLevel::Error, Some(c), Some(m))
+                    if (c.code == "E0433" && m.contains("use winapi::"))
+                        || (c.code == "E0455" && m.contains("link kind `framework`")) =>
+                {
+                    // Windows or macos only crate. Don't bother reporting errors.
+                    result.err_msg = String::new();
+                    return Ok(result);
+                }
+                (DiagnosticLevel::Error, _, Some(m)) => {
+                    result.err_msg.push_str(&m);
+                }
+                _ => (),
             }
-        })
-        .collect()
+        }
+    }
+
+    if !output.status.success() {
+        let stderr =
+            str::from_utf8(&output.stderr).context("error converting `cargo` stderr to `str`")?;
+        if stderr.contains("internal compiler error:") {
+            result.ice_msg = stderr.to_owned();
+        } else {
+            result.err_msg.push_str(stderr);
+        }
+    }
+
+    Ok(result)
 }
 
 fn extract_crate(file: &Path, target: &Path) -> Result<()> {
