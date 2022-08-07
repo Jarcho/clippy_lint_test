@@ -80,7 +80,7 @@ fn main() -> Result<()> {
                 });
                 let date = chrono::Local::today().format("%Y-%m-%d");
                 if let Some(name) = name {
-                    format!("{}-{}.txt", name, date)
+                    format!("{}-{}.txt", name.trim(), date)
                 } else {
                     format!("{}.txt", date)
                 }
