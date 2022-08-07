@@ -7,7 +7,7 @@ use rm_rf::remove;
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
-    fs,
+    fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
@@ -23,7 +23,7 @@ struct Args {
     clippy_dir: PathBuf,
 
     /// the name of the report file (default `CLIPPY_BRANCH_NAME-CURRENT_DATE.txt`)
-    #[argh(option, short = 'r', long = "report-file")]
+    #[argh(option, long = "report-file")]
     report_name: Option<PathBuf>,
 
     /// lints to test
@@ -31,16 +31,24 @@ struct Args {
     lints: Vec<String>,
 
     /// regex filter of which messages to accept
-    #[argh(option, short = 'f', long = "filter")]
+    #[argh(option, long = "filter")]
     filter: Option<String>,
 
     /// the number of crates to compile before clearing the target directory (default 500)
     #[argh(option, long = "cache-size")]
     cache_size: Option<usize>,
+
+    /// checks if `clippy --fix` would succeed
+    #[argh(switch, long = "fix")]
+    fix: bool,
 }
 
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
+    if args.filter.is_some() && args.fix {
+        bail!("`--filter` and `--fix` can't be used together");
+    }
+
     let filter = args
         .filter
         .map(|f| {
@@ -94,7 +102,7 @@ fn main() -> Result<()> {
             (name, 0usize)
         })
         .collect::<HashMap<_, _>>();
-    let mut per_crate_count = HashMap::<&str, (usize, bool)>::new();
+    let mut per_crate_count = HashMap::<&str, CrateStatus>::new();
 
     let home_dir = home::cargo_home().context("error finding cargo home dir")?;
     let crates_dir = home_dir
@@ -113,7 +121,7 @@ fn main() -> Result<()> {
     let target_dir = temp_dir.join("target");
 
     for (i, krate) in crates.iter().enumerate() {
-        if i > 0 && i % cache_size == 0 {
+        if i % cache_size == 0 {
             // Don't let the target directory get too big.
             let _ = remove(&target_dir);
         }
@@ -128,9 +136,21 @@ fn main() -> Result<()> {
             &crates_dir,
             krate,
             filter.as_ref(),
+            args.fix,
             temp_dir,
         ) {
             Ok(output) => {
+                if !output.fix_msg.is_empty() {
+                    println!("Failed to apply fixes");
+                    write!(
+                        report,
+                        "{}: Failed to apply fixes\n\n{}\n",
+                        krate, output.fix_msg
+                    )
+                    .context("error writing report")?;
+                    report.flush().context("error writing report")?;
+                    per_crate_count.entry(krate).or_default().fix_failed = true;
+                }
                 if !output.lint_msgs.is_empty() {
                     println!("Found {} warnings", output.lint_msgs.len());
                     write!(report, "{}: {} warnings\n\n", krate, output.lint_msgs.len())
@@ -142,14 +162,14 @@ fn main() -> Result<()> {
                     }
                     writeln!(report).context("error writing report")?;
                     report.flush().context("error writing report")?;
-                    per_crate_count.entry(krate).or_default().0 = output.lint_msgs.len();
+                    per_crate_count.entry(krate).or_default().lint_count = output.lint_msgs.len();
                 }
                 if !output.ice_msg.is_empty() {
                     println!();
                     write!(report, "{}: ICE\n\n{}\n", krate, output.ice_msg)
                         .context("error writing report")?;
                     report.flush().context("error writing report")?;
-                    per_crate_count.entry(krate).or_default().1 = true;
+                    per_crate_count.entry(krate).or_default().ice = true;
                 }
                 if !output.err_msg.is_empty() {
                     println!("{}", output.err_msg);
@@ -160,16 +180,8 @@ fn main() -> Result<()> {
     }
 
     write!(report, "\nReport summary:\n\n").context("error writing report")?;
-    for (krate, (count, ice)) in per_crate_count {
-        writeln!(
-            report,
-            "{}: {}{} warning{}",
-            krate,
-            if ice { "ICE, " } else { "" },
-            count,
-            if count == 1 { "" } else { "s" },
-        )
-        .context("error writing report")?
+    for (krate, status) in per_crate_count {
+        writeln!(report, "{}: {}", krate, status).context("error writing report")?
     }
     writeln!(report).context("error writing report")?;
     for (lint, count) in lint_counters {
@@ -179,6 +191,25 @@ fn main() -> Result<()> {
 
     let _ = remove(&target_dir);
     Ok(())
+}
+
+#[derive(Default)]
+struct CrateStatus {
+    lint_count: usize,
+    ice: bool,
+    fix_failed: bool,
+}
+impl fmt::Display for CrateStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}{}{} warning{}",
+            if self.ice { "ICE, " } else { "" },
+            if self.fix_failed { "Fix failed, " } else { "" },
+            self.lint_count,
+            if self.lint_count == 1 { "" } else { "s" },
+        )
+    }
 }
 
 fn find_crates(p: &Path) -> Result<HashMap<String, LatestVersions>> {
@@ -298,8 +329,10 @@ struct RunOutput {
     pub lint_msgs: Vec<String>,
     pub err_msg: String,
     pub ice_msg: String,
+    pub fix_msg: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_crate(
     clippy_args: &ClippyArgs,
     target_dir: &Path,
@@ -307,6 +340,7 @@ fn check_crate(
     crates_dir: &Path,
     krate: &str,
     filter: Option<&Regex>,
+    fix: bool,
     temp_dir: &Path,
 ) -> Result<RunOutput> {
     extract_crate(&crates_dir.join(format!("{}.crate", krate)), temp_dir)?;
@@ -318,7 +352,7 @@ fn check_crate(
     let manifest_path = path.join("Cargo.toml");
     prepare_manifest(&manifest_path)?;
 
-    let args: [&OsStr; 14] = [
+    let args: [&OsStr; 7] = [
         "--".as_ref(), // command name
         "--manifest-path".as_ref(),
         manifest_path.as_ref(),
@@ -326,6 +360,13 @@ fn check_crate(
         "--message-format=json".as_ref(),
         "--target-dir".as_ref(),
         target_dir.as_ref(),
+    ];
+    let mut command = clippy_args.run_command();
+    command.args(args);
+    if fix {
+        command.args(["--fix", "--allow-no-vcs"]);
+    }
+    let args: [&OsStr; 7] = [
         "--".as_ref(),
         "--cap-lints".as_ref(),
         "warn".as_ref(),
@@ -334,7 +375,6 @@ fn check_crate(
         "-C".as_ref(),
         "incremental=false".as_ref(),
     ];
-    let mut command = clippy_args.run_command();
     command.args(args);
     for lint in lints.keys() {
         let args: [&OsStr; 2] = ["--warn".as_ref(), lint.as_ref()];
@@ -381,6 +421,8 @@ fn check_crate(
             str::from_utf8(&output.stderr).context("error converting `cargo` stderr to `str`")?;
         if stderr.contains("internal compiler error:") {
             result.ice_msg = stderr.to_owned();
+        } else if stderr.contains("failed to automatically apply fixes") {
+            result.fix_msg = stderr.to_owned();
         } else {
             result.err_msg.push_str(stderr);
         }
