@@ -381,8 +381,25 @@ fn check_crate(
     let output = command.output().context("error running `cargo`")?;
 
     let mut result = RunOutput::default();
+    let stderr =
+        str::from_utf8(&output.stderr).context("error converting `cargo` stderr to `str`")?;
 
     if !output.status.success() {
+        if stderr.contains("failed to run custom build command") {
+            if let Some((pkg, _)) = stderr
+                .split("\n--- stderr\n")
+                .skip(1)
+                .filter_map(|msg| {
+                    msg.trim()
+                        .strip_prefix("Package")
+                        .and_then(|msg| msg.trim_start().split_once(' '))
+                })
+                .find(|(_, msg)| msg.contains("was not found in the pkg-config search path"))
+            {
+                result.err_msg = format!("pkg-config error: missing package `{}`\n", pkg);
+                return Ok(result);
+            }
+        }
         result.err_msg = format!("error running clippy ({}):\n", output.status);
     }
 
@@ -398,11 +415,23 @@ fn check_crate(
                         }
                     }
                 }
+                // Unfixable errors - don't report
                 (DiagnosticLevel::Error, Some(c), Some(m))
-                    if (c.code == "E0433" && m.contains("use winapi::"))
-                        || (c.code == "E0455" && m.contains("link kind `framework`")) =>
+                    if ((c.code == "E0432" || c.code == "E0433") && m.contains("use winapi")
+                        || m.contains("use std::os::windows"))
+                        || (c.code == "E0455" && m.contains("link kind `framework`"))
+                        || (c.code == "E0557" && m.contains("feature has been removed"))
+                        || (c.code == "E0635" && m.contains("unknown feature")) =>
                 {
-                    // Windows or macos only crate. Don't bother reporting errors.
+                    result.err_msg = String::new();
+                    return Ok(result);
+                }
+                (DiagnosticLevel::Error, None, Some(m))
+                    if m.contains("MacOSX or iOS")
+                        || m.contains("macos or ios")
+                        || m.contains("is deprecated")
+                        || m.contains("Renamed to") =>
+                {
                     result.err_msg = String::new();
                     return Ok(result);
                 }
@@ -415,8 +444,6 @@ fn check_crate(
     }
 
     if !output.status.success() {
-        let stderr =
-            str::from_utf8(&output.stderr).context("error converting `cargo` stderr to `str`")?;
         if stderr.contains("internal compiler error:") {
             result.ice_msg = stderr.to_owned();
         } else if stderr.contains("failed to automatically apply fixes") {
