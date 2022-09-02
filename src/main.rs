@@ -328,6 +328,17 @@ struct RunOutput {
     pub fix_msg: String,
 }
 
+enum RunResult {
+    Complete(RunOutput),
+    MultipleCrates(String),
+    FailedParseManifest(String),
+}
+impl From<RunOutput> for RunResult {
+    fn from(f: RunOutput) -> Self {
+        Self::Complete(f)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_crate(
     clippy_args: &ClippyArgs,
@@ -346,7 +357,7 @@ fn check_crate(
     remove_file(&path.join(".cargo").join("config"))?;
     remove_file(&path.join("Cargo.lock"))?;
     let manifest_path = path.join("Cargo.toml");
-    prepare_manifest(&manifest_path, &path.join("Cargo.toml.orig"))?;
+    let mut manifest = prepare_manifest(&manifest_path, &path.join("Cargo.toml.orig"))?;
     let _ = remove(&path.join("tests"));
     let _ = remove(&path.join("benches"));
 
@@ -378,7 +389,45 @@ fn check_crate(
         let args: [&OsStr; 2] = ["--warn".as_ref(), lint.as_ref()];
         command.args(args);
     }
-    let output = command.output().context("error running `cargo`")?;
+
+    let mut failed_parse_manifest = false;
+    let mut multiple_crates = false;
+    loop {
+        match compile_crate(&mut command, lints, filter)? {
+            RunResult::Complete(x) => break Ok(x),
+            RunResult::FailedParseManifest(_) if !failed_parse_manifest => {
+                failed_parse_manifest = true;
+                let removed = write_without_extras(&mut manifest, &manifest_path)?;
+                if removed.benches {
+                    let _ = remove(&path.join("benches"));
+                }
+                if removed.examples {
+                    let _ = remove(&path.join("examples"));
+                }
+                if removed.tests {
+                    let _ = remove(&path.join("tests"));
+                }
+            }
+            RunResult::MultipleCrates(_) if !multiple_crates => {
+                multiple_crates = true;
+                let _ = remove(target_dir);
+            }
+            RunResult::FailedParseManifest(m) | RunResult::MultipleCrates(m) => {
+                break Ok(RunOutput {
+                    err_msg: m,
+                    ..RunOutput::default()
+                });
+            }
+        }
+    }
+}
+
+fn compile_crate(
+    c: &mut Command,
+    lints: &mut HashMap<String, usize>,
+    filter: Option<&Regex>,
+) -> Result<RunResult> {
+    let output = c.output().context("error running `cargo`")?;
 
     let mut result = RunOutput::default();
     let stderr =
@@ -397,8 +446,12 @@ fn check_crate(
                 .find(|(_, msg)| msg.contains("was not found in the pkg-config search path"))
             {
                 result.err_msg = format!("pkg-config error: missing package `{}`\n", pkg);
-                return Ok(result);
+                return Ok(result.into());
             }
+        } else if stderr.contains("failed to parse manifest at") {
+            result.err_msg = format!("error running clippy ({}):\n", output.status);
+            result.err_msg.push_str(stderr);
+            return Ok(RunResult::FailedParseManifest(result.err_msg));
         }
         result.err_msg = format!("error running clippy ({}):\n", output.status);
     }
@@ -415,7 +468,10 @@ fn check_crate(
                         }
                     }
                 }
-                // Unfixable errors - don't report
+                (DiagnosticLevel::Error, Some(c), Some(m)) if c.code == "E0464" => {
+                    result.err_msg.push_str(&m);
+                    return Ok(RunResult::MultipleCrates(result.err_msg));
+                }
                 (DiagnosticLevel::Error, Some(c), Some(m))
                     if ((c.code == "E0432" || c.code == "E0433") && m.contains("use winapi")
                         || m.contains("use std::os::windows"))
@@ -423,8 +479,9 @@ fn check_crate(
                         || (c.code == "E0557" && m.contains("feature has been removed"))
                         || (c.code == "E0635" && m.contains("unknown feature")) =>
                 {
+                    // Platform dependent errors - don't report
                     result.err_msg = String::new();
-                    return Ok(result);
+                    break;
                 }
                 (DiagnosticLevel::Error, None, Some(m))
                     if m.contains("MacOSX or iOS")
@@ -432,8 +489,9 @@ fn check_crate(
                         || m.contains("is deprecated")
                         || m.contains("Renamed to") =>
                 {
+                    // Platform dependent errors - don't report
                     result.err_msg = String::new();
-                    return Ok(result);
+                    break;
                 }
                 (DiagnosticLevel::Error, _, Some(m)) => {
                     result.err_msg.push_str(&m);
@@ -453,7 +511,7 @@ fn check_crate(
         }
     }
 
-    Ok(result)
+    Ok(result.into())
 }
 
 fn extract_crate(file: &Path, target: &Path) -> Result<()> {
@@ -466,7 +524,7 @@ fn extract_crate(file: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("error unpacking file `{}`", file.display()))
 }
 
-fn prepare_manifest(path: &Path, orig_path: &Path) -> Result<()> {
+fn prepare_manifest(path: &Path, orig_path: &Path) -> Result<toml::Value> {
     let mut contents: toml::Value = fs::read_to_string(orig_path)
         .or_else(|_| fs::read_to_string(path))
         .with_context(|| format!("error reading file `{}`", path.display()))?
@@ -475,7 +533,6 @@ fn prepare_manifest(path: &Path, orig_path: &Path) -> Result<()> {
 
     if let toml::Value::Table(table) = &mut contents {
         if table.remove("workspace").is_some()
-            | table.remove("bench").is_some()
             | table
                 .get_mut("dependencies")
                 .map_or(false, remove_toml_path_deps)
@@ -497,7 +554,28 @@ fn prepare_manifest(path: &Path, orig_path: &Path) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(contents)
+}
+
+#[derive(Default)]
+struct ExtrasRemoved {
+    benches: bool,
+    examples: bool,
+    tests: bool,
+}
+
+fn write_without_extras(value: &mut toml::Value, path: &Path) -> Result<ExtrasRemoved> {
+    let mut res = ExtrasRemoved::default();
+    if let toml::Value::Table(table) = value {
+        res.benches = table.remove("bench").is_some();
+        res.examples = table.remove("example").is_some();
+        res.tests = table.remove("test").is_some();
+        if res.benches || res.examples || res.tests {
+            fs::write(path, value.to_string())
+                .with_context(|| format!("error writing file `{}`", path.display()))?;
+        }
+    }
+    Ok(res)
 }
 
 fn remove_file(p: &Path) -> Result<()> {
