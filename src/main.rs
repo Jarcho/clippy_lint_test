@@ -172,7 +172,13 @@ fn main() -> Result<()> {
                     per_crate_count.entry(krate).or_default().ice = true;
                 }
                 if !output.err_msg.is_empty() {
-                    println!("{}", output.err_msg);
+                    for line in output.err_msg.lines() {
+                        if line.is_empty() {
+                            println!();
+                        } else {
+                            println!("  {}", line);
+                        }
+                    }
                 }
             }
             Err(e) => eprintln!("{}", e),
